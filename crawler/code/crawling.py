@@ -7,6 +7,11 @@ import logging
 import re
 import time
 import urllib.parse
+from dautil import data
+import os
+from datetime import datetime as dt
+import csv
+import reporting
 
 try:
     # Python 3.4.
@@ -63,6 +68,8 @@ class Crawler:
         self.done = []
         self.connector = aiohttp.TCPConnector(loop=self.loop)
         self.root_domains = set()
+        self.csv_lines = []
+
         for root in roots:
             parts = urllib.parse.urlparse(root)
             host, port = urllib.parse.splitport(parts.netloc)
@@ -76,14 +83,33 @@ class Crawler:
                     self.root_domains.add(host)
                 else:
                     self.root_domains.add(lenient_host(host))
+
+            self.filedir = os.path.join(data.get_data_dir(), host)
+
+            if not os.path.exists(self.filedir):
+                os.mkdir(self.filedir)
+
         for root in roots:
             self.add_url(root)
+
+
+        self.datetime = dt.utcnow().strftime("%a_%b_%d_%H_%M_%S_%Z_%Y")
+        self.csv_file = os.path.join(self.filedir, 'saved_urls.csv')
+
         self.t0 = time.time()
         self.t1 = None
 
     def close(self):
         """Close resources."""
         self.connector.close()
+
+        with open(self.csv_file, "w") as fp:
+            wr = csv.writer(fp)
+
+            for line in self.csv_lines:
+                wr.writerow(line)
+
+
 
     def host_okay(self, host):
         """Check if a host should be crawled.
@@ -122,7 +148,7 @@ class Crawler:
         self.done.append(fetch_statistic)
 
     @asyncio.coroutine
-    def parse_links(self, response):
+    def parse_links(self, response, count, url):
         """Return a FetchStatistic and list of links."""
         links = set()
         content_type = None
@@ -137,8 +163,13 @@ class Crawler:
                 content_type, pdict = cgi.parse_header(content_type)
 
             encoding = pdict.get('charset', 'utf-8')
+
             if content_type in ('text/html', 'application/xml'):
                 text = yield from response.text()
+                basename = os.path.basename(url)
+
+                if basename.endswith('html'):
+                    self.csv_lines.append([self.datetime, count, basename, url])
 
                 # Replace href with (?:href|src) to follow image links.
                 urls = set(re.findall(r'''(?i)href=["']?([^\s"'<>]+)''',
@@ -166,7 +197,7 @@ class Crawler:
         return stat, links
 
     @asyncio.coroutine
-    def fetch(self, url, max_redirect):
+    def fetch(self, url, max_redirect, count):
         """Fetch one URL."""
         tries = 0
         exception = None
@@ -222,7 +253,8 @@ class Crawler:
                 LOGGER.error('redirect limit reached for %r from %r',
                              next_url, url)
         else:
-            stat, links = yield from self.parse_links(response)
+            print(count, url)
+            stat, links = yield from self.parse_links(response, count, url)
             self.record_statistic(stat)
             for link in links.difference(self.seen_urls):
                 self.q.put_nowait((link, self.max_redirect))
@@ -231,12 +263,21 @@ class Crawler:
 
     @asyncio.coroutine
     def work(self):
-        """Process queue items forever."""
-        while True:
+        """Process queue items."""
+        self.count = 0
+
+        while self.count < 1000:
             url, max_redirect = yield from self.q.get()
             assert url in self.seen_urls
-            yield from self.fetch(url, max_redirect)
+            yield from self.fetch(url, max_redirect, self.count)
+            self.count += 1
             self.q.task_done()
+            LOGGER.info('Queue size %d', self.q.qsize())
+
+        raise KeyboardInterrupt()
+
+
+
 
     def url_allowed(self, url):
         if self.exclude and re.search(self.exclude, url):
